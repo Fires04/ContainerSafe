@@ -1,0 +1,156 @@
+:root {
+  --accent: #e8590c;
+  --accent-text: #ffffff;
+  --bg: #f5f6f8;
+  --card-bg: #ffffff;
+  --text: #1a1d21;
+  --text-muted: #626a73;
+  --border: #dde1e6;
+  --error-bg: #fdecec;
+  --error-text: #a4262c;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --accent: #ff922b;
+    --accent-text: #2b1400;
+    --bg: #14171a;
+    --card-bg: #1c2024;
+    --text: #eef1f4;
+    --text-muted: #9aa3ad;
+    --border: #2c3238;
+    --error-bg: #3a1f20;
+    --error-text: #f2a3a7;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body.login-body {
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  color: var(--text);
+  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+.login-card {
+  width: min(360px, 90vw);
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px 28px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.brand {
+  text-align: center;
+  margin-bottom: 4px;
+}
+
+.brand .logo {
+  width: 64px;
+  height: 64px;
+  margin: 0 auto;
+}
+
+.brand .logo img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.brand h1 {
+  font-size: 20px;
+  margin: 8px 0 2px;
+}
+
+.brand .subtitle {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.login-card label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.login-card input[type="text"],
+.login-card input[type="password"] {
+  font-size: 15px;
+  padding: 9px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.checkbox-row {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 8px !important;
+  font-size: 13px;
+}
+
+.login-card button {
+  margin-top: 6px;
+  padding: 10px;
+  border: none;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--accent-text);
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.login-card button:hover {
+  filter: brightness(1.05);
+}
+
+.error-box {
+  background: var(--error-bg);
+  color: var(--error-text);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+
+.oidc-button {
+  display: block;
+  text-align: center;
+  padding: 9px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 14px;
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.divider::before,
+.divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}

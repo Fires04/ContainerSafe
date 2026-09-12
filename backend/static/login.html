@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ContainerSafe — sign in</title>
+<link rel="icon" href="/static/favicon.ico">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <form class="login-card" method="post" action="/login">
+    <input type="hidden" name="csrf_token" value="__CSRF_TOKEN__">
+    <div class="brand">
+      <div class="logo"><img src="/static/logo.png" alt="ContainerSafe"></div>
+      <h1>ContainerSafe</h1>
+      <p class="subtitle">Container backup &amp; restore</p>
+    </div>
+    <div id="login-error" class="error-box" hidden>Incorrect username or password.</div>
+    <!-- OIDC_BUTTON -->
+    <label>Username
+      <input type="text" name="username" autocomplete="username" required autofocus>
+    </label>
+    <label>Password
+      <input type="password" name="password" autocomplete="current-password" required>
+    </label>
+    <label class="checkbox-row">
+      <input type="checkbox" name="remember" value="1">
+      Stay signed in
+    </label>
+    <button type="submit">Sign in</button>
+  </form>
+  <script>
+    if (new URLSearchParams(location.search).get('error')) {
+      document.getElementById('login-error').hidden = false;
+    }
+  </script>
+</body>
+</html>

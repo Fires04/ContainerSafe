@@ -1,0 +1,21 @@
+[project]
+name = "containersafe-agent"
+version = "0.1.0"
+description = "ContainerSafe agent - connects to a central server and backs up containers on its own host"
+requires-python = ">=3.12"
+dependencies = [
+    "websockets>=13.0",
+]
+# containersafe-agentcore is installed separately (see Dockerfile) —
+# not listed here, since it has no PyPI index to resolve from; it's just
+# already importable in the same environment by the time this installs.
+
+[project.scripts]
+containersafe-agent = "containersafe_agent.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["containersafe_agent*"]

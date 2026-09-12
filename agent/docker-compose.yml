@@ -1,0 +1,21 @@
+services:
+  containersafe-agent:
+    build:
+      context: ..
+      dockerfile: agent/Dockerfile
+    container_name: containersafe-agent
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Staging area for in-progress backups — same ./data convention as
+      # the server. See .env's HOST_DATA_DIR comment for why the host
+      # path also needs to be told to the container explicitly.
+      - ./data:/app/data
+      # Root-equivalent host access, same caveat as the server's own
+      # docker-compose.yml — this agent can create/inspect/remove any
+      # container on this host. It never receives storage-target
+      # credentials though (see docs/MULTI_HOST_PLAN.md); all it ever
+      # does is stream backup archives to the server over the
+      # authenticated WebSocket connection.
+      - /var/run/docker.sock:/var/run/docker.sock

@@ -1,0 +1,32 @@
+[project]
+name = "containersafe"
+version = "0.1.0"
+description = "ContainerSafe - discovers, backs up and restores Docker containers on a host"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "sqlalchemy>=2.0",
+    "docker>=7.1",
+    "apscheduler>=3.10",
+    # Shared signed-cookie session + optional Authentik/OIDC login — see
+    # https://github.com/Fires04/FireAuth. Pin to a tag once one exists;
+    # branch head is fine while both repos are this new.
+    "fireauth[oidc,ratelimit] @ git+https://github.com/Fires04/FireAuth.git",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

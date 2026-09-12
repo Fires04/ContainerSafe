@@ -1,0 +1,12 @@
+/* Mantine (imported in main.tsx) handles component styling and
+   light/dark theming via its own CSS variables — this file only covers
+   what's outside its scope: the document root. */
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}

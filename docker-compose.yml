@@ -1,0 +1,30 @@
+services:
+  containersafe:
+    build: .
+    container_name: containersafe
+    restart: unless-stopped
+    ports:
+      # Change the left side if 8094 is already taken on your host.
+      - "8094:8000"
+    env_file:
+      - .env
+    volumes:
+      # Hand-maintained/generated data that must survive `docker compose up
+      # --build` (SQLite DB, backup-run staging area, restore scratch space).
+      - ./data:/app/data
+      # Default local backup destination — see README for adding a remote
+      # (SFTP/SMB via rclone) target instead/in addition, and for pointing
+      # this at an NFS share mounted at the host/OS level.
+      - ./backup:/app/backup
+      # Docker access — root-equivalent host access (the daemon API can run
+      # a container with arbitrary host mounts/capabilities, "read-only
+      # socket" isn't a real boundary). This is why login is mandatory in
+      # this app, not optional. See README's Security section.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Optional, OFF by default (also requires HOSTFS_ENABLED=true in
+      # .env — two separate opt-ins on purpose). Only used for best-effort
+      # capture of the real docker-compose.yml/.env text of discovered
+      # containers; never required for backing up or restoring actual
+      # container data (that goes through helper containers instead, see
+      # backend/app/backup.py).
+      # - /:/hostfs:ro
