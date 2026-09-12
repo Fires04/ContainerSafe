@@ -32,7 +32,9 @@ function jsonInit(method: string, body: unknown): RequestInit {
 
 export interface JobPayload {
   host_id: string
+  scope_type: 'container' | 'project'
   identity_keys: string[]
+  compose_project?: string | null
   display_name?: string
   schedule_cron: string
   retention_count?: number | null

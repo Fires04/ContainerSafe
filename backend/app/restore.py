@@ -134,27 +134,14 @@ def _find_by_name(client: docker.DockerClient, name: str):
     return next((c for c in client.containers.list(all=True) if c.name == name), None)
 
 
-def _perform_restore(
-    client: docker.DockerClient,
-    extract_dir_host: str,
-    config_json: dict,
-    container_name_override: str | None,
-    allow_takeover: bool,
-    log_line,
-) -> str:
-    """The actual restore mechanics, shared by both entry points below.
-    Returns the final container name. Raises RestoreError/ArchiveError/
-    docker exceptions on failure — callers wrap this in their own
-    run-tracking try/except."""
-    recreate_spec = config_json["recreate_spec"]
-
-    for net in config_json.get("networks", []):
-        _ensure_network(client, net, log_line)
-
-    for vol in config_json.get("volumes", []):
-        _ensure_volume(client, vol, log_line)
-
-    for item in config_json.get("data_manifest", []):
+def _restore_data_manifest(
+    client: docker.DockerClient, extract_dir_host: str, data_manifest: list[dict], log_line
+) -> None:
+    """Shared by the single-container and project restore paths — the
+    archive layout (data/<kind>/<name>.tar.gz per manifest entry) is
+    identical either way, only how many containers get created from the
+    result differs."""
+    for item in data_manifest:
         if item["kind"] == "volumes":
             target_host_path = client.volumes.get(item["name"]).attrs["Mountpoint"]
         else:
@@ -168,6 +155,17 @@ def _perform_restore(
             target_host_path=target_host_path,
         )
 
+
+def _create_and_start(
+    client: docker.DockerClient,
+    recreate_spec: dict,
+    base_name: str,
+    allow_takeover: bool,
+    log_line,
+) -> str:
+    """Pulls the image if needed, resolves a name collision, and creates
+    +starts the container. Shared by the single-container and project
+    restore paths — called once per container either way."""
     image = recreate_spec["image"]
     try:
         client.images.get(image)
@@ -175,7 +173,6 @@ def _perform_restore(
         log_line(f"Pulling image {image!r}")
         client.images.pull(image)
 
-    base_name = container_name_override or config_json.get("container_name") or config_json["identity_key"]
     existing = _find_by_name(client, base_name)
     final_name = base_name
     if existing:
@@ -217,6 +214,63 @@ def _perform_restore(
 
     log_line(f"Container {final_name!r} started ({container.short_id})")
     return final_name
+
+
+def _perform_restore(
+    client: docker.DockerClient,
+    extract_dir_host: str,
+    config_json: dict,
+    container_name_override: str | None,
+    allow_takeover: bool,
+    log_line,
+) -> str:
+    """The actual single-container restore mechanics, shared by both
+    entry points below. Returns the final container name. Raises
+    RestoreError/ArchiveError/docker exceptions on failure — callers wrap
+    this in their own run-tracking try/except."""
+    recreate_spec = config_json["recreate_spec"]
+
+    for net in config_json.get("networks", []):
+        _ensure_network(client, net, log_line)
+
+    for vol in config_json.get("volumes", []):
+        _ensure_volume(client, vol, log_line)
+
+    _restore_data_manifest(client, extract_dir_host, config_json.get("data_manifest", []), log_line)
+
+    base_name = container_name_override or config_json.get("container_name") or config_json["identity_key"]
+    return _create_and_start(client, recreate_spec, base_name, allow_takeover, log_line)
+
+
+def _perform_project_restore(
+    client: docker.DockerClient,
+    extract_dir_host: str,
+    config_json: dict,
+    allow_takeover: bool,
+    log_line,
+) -> list[str]:
+    """Project-scope equivalent of _perform_restore: recreates every
+    network/volume the project's containers collectively used, restores
+    the (deduped) data once, then creates+starts every member container
+    from its own recreate_spec. No per-container rename support here (the
+    "restore under a different name" UI flow is a single-container
+    concept) — a name collision still gets the same automatic
+    "-restored-<timestamp>" suffix, independently per container. Returns
+    the list of final container names, in the same order as
+    config_json["containers"]."""
+    for net in config_json.get("networks", []):
+        _ensure_network(client, net, log_line)
+
+    for vol in config_json.get("volumes", []):
+        _ensure_volume(client, vol, log_line)
+
+    _restore_data_manifest(client, extract_dir_host, config_json.get("data_manifest", []), log_line)
+
+    final_names = []
+    for member in config_json.get("containers", []):
+        base_name = member.get("container_name") or member["identity_key"]
+        final_names.append(_create_and_start(client, member["recreate_spec"], base_name, allow_takeover, log_line))
+    return final_names
 
 
 _RESTORE_EXCEPTIONS = (
@@ -300,9 +354,15 @@ def restore_backup_run(run_id: int, container_name_override: str | None = None, 
         config_json = json.loads((extract_dir / "config.json").read_text())
         extract_dir_host = endpoint.host_path_for_data(f"restore_tmp/{restore_id}/extracted")
 
-        final_name = _perform_restore(
-            client, extract_dir_host, config_json, container_name_override, allow_takeover, log_line
-        )
+        if config_json.get("scope") == "project":
+            if container_name_override:
+                log_line("Ignoring requested container name — not applicable to a whole-project restore")
+            final_names = _perform_project_restore(client, extract_dir_host, config_json, allow_takeover, log_line)
+            final_name = ", ".join(final_names)
+        else:
+            final_name = _perform_restore(
+                client, extract_dir_host, config_json, container_name_override, allow_takeover, log_line
+            )
 
         with get_session() as session:
             run = session.get(RestoreRun, restore_id)
@@ -341,6 +401,52 @@ def _cleanup_stale_uploads() -> None:
 
 
 def _build_preview(config_json: dict, host_id: str = "local") -> dict:
+    is_project = config_json.get("scope") == "project"
+    common = {
+        "scope": "project" if is_project else "container",
+        "created_at": config_json.get("created_at"),
+        "app_version": config_json.get("app_version"),
+        "compose": config_json.get("compose"),
+        "schema_version": config_json.get("schema_version"),
+        "networks": [{"name": n.get("name"), "driver": n.get("driver")} for n in config_json.get("networks", [])],
+        "volumes": [{"name": v.get("name"), "driver": v.get("driver")} for v in config_json.get("volumes", [])],
+        "data_manifest": [
+            {"kind": m["kind"], "name": m["name"], "destination": m["destination"]}
+            for m in config_json.get("data_manifest", [])
+        ],
+    }
+
+    if is_project:
+        try:
+            client = get_endpoint(host_id).client()
+        except docker.errors.DockerException:
+            client = None
+        member_previews = []
+        for member in config_json.get("containers", []):
+            base_name = member.get("container_name") or member["identity_key"]
+            existing = _find_by_name(client, base_name) if client is not None else None
+            member_previews.append(
+                {
+                    "identity_key": member.get("identity_key"),
+                    "container_name": base_name,
+                    "image": member.get("recreate_spec", {}).get("image"),
+                    "name_conflict": existing is not None,
+                    "name_conflict_running": bool(existing and existing.status == "running"),
+                }
+            )
+        return {
+            **common,
+            "containers": member_previews,
+            "identity_key": config_json.get("compose_project"),
+            "container_name": config_json.get("compose_project"),
+            "image": None,
+            "mounts": [],
+            "ports": None,
+            "restart_policy": None,
+            "name_conflict": any(c["name_conflict"] for c in member_previews),
+            "name_conflict_running": any(c["name_conflict_running"] for c in member_previews),
+        }
+
     recreate_spec = config_json.get("recreate_spec", {})
     base_name = config_json.get("container_name") or config_json.get("identity_key")
 
@@ -355,20 +461,11 @@ def _build_preview(config_json: dict, host_id: str = "local") -> dict:
         pass  # daemon unreachable — preview still useful without this hint
 
     return {
+        **common,
         "identity_key": config_json.get("identity_key"),
         "container_name": base_name,
         "image": recreate_spec.get("image"),
-        "created_at": config_json.get("created_at"),
-        "app_version": config_json.get("app_version"),
-        "compose": config_json.get("compose"),
-        "schema_version": config_json.get("schema_version"),
-        "networks": [{"name": n.get("name"), "driver": n.get("driver")} for n in config_json.get("networks", [])],
-        "volumes": [{"name": v.get("name"), "driver": v.get("driver")} for v in config_json.get("volumes", [])],
         "mounts": recreate_spec.get("mounts", []),
-        "data_manifest": [
-            {"kind": m["kind"], "name": m["name"], "destination": m["destination"]}
-            for m in config_json.get("data_manifest", [])
-        ],
         "ports": recreate_spec.get("ports"),
         "restart_policy": recreate_spec.get("restart_policy"),
         "name_conflict": name_conflict,
@@ -449,9 +546,15 @@ def restore_from_upload(
         config_json = json.loads(config_path.read_text())
         extract_dir_host = endpoint.host_path_for_data(f"restore_tmp/upload-{upload_id}")
 
-        final_name = _perform_restore(
-            client, extract_dir_host, config_json, container_name_override, allow_takeover, log_line
-        )
+        if config_json.get("scope") == "project":
+            if container_name_override:
+                log_line("Ignoring requested container name — not applicable to a whole-project restore")
+            final_names = _perform_project_restore(client, extract_dir_host, config_json, allow_takeover, log_line)
+            final_name = ", ".join(final_names)
+        else:
+            final_name = _perform_restore(
+                client, extract_dir_host, config_json, container_name_override, allow_takeover, log_line
+            )
 
         with get_session() as session:
             run = session.get(RestoreRun, restore_id)

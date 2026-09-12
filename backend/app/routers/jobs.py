@@ -32,10 +32,20 @@ def _resolve_containers(session, host_id: str, identity_keys: list[str]) -> dict
     return by_key
 
 
+def _count_project_containers(session, host_id: str, compose_project: str) -> int:
+    return (
+        session.query(DiscoveredContainer)
+        .filter_by(host_id=host_id, compose_project=compose_project)
+        .count()
+    )
+
+
 def _to_out(row: BackupJob, target_name: str | None, container_names: list[str]) -> BackupJobOut:
     return BackupJobOut(
         id=row.id,
         host_id=row.host_id,
+        scope_type=row.scope_type,
+        compose_project=row.compose_project,
         identity_keys=list(row.identity_keys_json or []),
         container_names=container_names,
         display_name=row.display_name,
@@ -101,18 +111,29 @@ def list_jobs():
 def create_job(payload: BackupJobIn):
     _validate_cron(payload.schedule_cron)
     with db.get_session() as session:
-        containers = _resolve_containers(session, payload.host_id, payload.identity_keys)
         target = session.get(StorageTarget, payload.storage_target_id)
         if target is None:
             raise HTTPException(404, "Storage target not found")
 
-        default_name = containers[payload.identity_keys[0]].name
-        if len(payload.identity_keys) > 1:
-            default_name += f" +{len(payload.identity_keys) - 1} more"
+        if payload.scope_type == "project":
+            if _count_project_containers(session, payload.host_id, payload.compose_project) == 0:
+                raise HTTPException(404, f"No discovered containers for compose project {payload.compose_project!r}")
+            default_name = payload.compose_project
+            identity_keys: list[str] = []
+            container_names: list[str] = []
+        else:
+            containers = _resolve_containers(session, payload.host_id, payload.identity_keys)
+            default_name = containers[payload.identity_keys[0]].name
+            if len(payload.identity_keys) > 1:
+                default_name += f" +{len(payload.identity_keys) - 1} more"
+            identity_keys = payload.identity_keys
+            container_names = [c.name for c in containers.values()]
 
         row = BackupJob(
             host_id=payload.host_id,
-            identity_keys_json=payload.identity_keys,
+            scope_type=payload.scope_type,
+            compose_project=payload.compose_project if payload.scope_type == "project" else None,
+            identity_keys_json=identity_keys,
             display_name=payload.display_name or default_name,
             schedule_cron=payload.schedule_cron,
             retention_count=payload.retention_count,
@@ -126,7 +147,7 @@ def create_job(payload: BackupJobIn):
         session.commit()
         session.refresh(row)
         scheduler.resync()
-        return _to_out(row, target.name, [c.name for c in containers.values()])
+        return _to_out(row, target.name, container_names)
 
 
 @router.put("/{job_id}", response_model=BackupJobOut)
@@ -136,12 +157,22 @@ def update_job(job_id: int, payload: BackupJobIn):
         row = session.get(BackupJob, job_id)
         if row is None:
             raise HTTPException(404, "Not found")
-        containers = _resolve_containers(session, row.host_id, payload.identity_keys)
         target = session.get(StorageTarget, payload.storage_target_id)
         if target is None:
             raise HTTPException(404, "Storage target not found")
 
-        row.identity_keys_json = payload.identity_keys
+        if payload.scope_type == "project":
+            if _count_project_containers(session, row.host_id, payload.compose_project) == 0:
+                raise HTTPException(404, f"No discovered containers for compose project {payload.compose_project!r}")
+            row.identity_keys_json = []
+            container_names: list[str] = []
+        else:
+            containers = _resolve_containers(session, row.host_id, payload.identity_keys)
+            row.identity_keys_json = payload.identity_keys
+            container_names = [c.name for c in containers.values()]
+
+        row.scope_type = payload.scope_type
+        row.compose_project = payload.compose_project if payload.scope_type == "project" else None
         row.display_name = payload.display_name or row.display_name
         row.schedule_cron = payload.schedule_cron
         row.retention_count = payload.retention_count
@@ -153,7 +184,7 @@ def update_job(job_id: int, payload: BackupJobIn):
         session.commit()
         session.refresh(row)
         scheduler.resync()
-        return _to_out(row, target.name, [c.name for c in containers.values()])
+        return _to_out(row, target.name, container_names)
 
 
 @router.delete("/{job_id}", status_code=204)
@@ -185,13 +216,19 @@ def run_now(job_id: int, background_tasks: BackgroundTasks):
         job = session.get(BackupJob, job_id)
         if job is None:
             raise HTTPException(404, "Not found")
-        identity_keys = list(job.identity_keys_json or [])
-        if not identity_keys:
-            raise HTTPException(400, "This job has no member containers")
+        if job.scope_type == "project":
+            if not job.compose_project:
+                raise HTTPException(400, "This job has no compose project configured")
+            expected_count = 1
+        else:
+            identity_keys = list(job.identity_keys_json or [])
+            if not identity_keys:
+                raise HTTPException(400, "This job has no member containers")
+            expected_count = len(identity_keys)
 
     batch_id = uuid.uuid4().hex
     background_tasks.add_task(run_backup_job, job_id, batch_id)
-    return BackupBatchOut(batch_id=batch_id, expected_count=len(identity_keys), runs=[])
+    return BackupBatchOut(batch_id=batch_id, expected_count=expected_count, runs=[])
 
 
 @router.get("/{job_id}/runs", response_model=list[BackupRunOut])

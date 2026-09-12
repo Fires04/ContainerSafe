@@ -89,14 +89,42 @@ def run_backup_job(job_id: int, batch_id: str | None = None) -> str:
         target = session.get(StorageTarget, job.storage_target_id)
         if target is None:
             raise BackupError("This job's storage target no longer exists")
+        scope_type = job.scope_type
+        compose_project = job.compose_project
         identity_keys = list(job.identity_keys_json or [])
-        if not identity_keys:
+        if scope_type == "project":
+            if not compose_project:
+                raise BackupError("This job has no compose project configured")
+        elif not identity_keys:
             raise BackupError("This job has no member containers")
         job_host_id = job.host_id
         job_dest_subpath = job.dest_subpath
         job_include_bind_mounts = job.include_bind_mounts
 
     batch_id = batch_id or uuid.uuid4().hex
+
+    if scope_type == "project":
+        if job_host_id != "local":
+            # Agent-hosted project backup isn't built yet — same "designed,
+            # not wired up" status as agent-hosted cross-host restore (see
+            # docs/MULTI_HOST_PLAN.md's M-Agent-2). Recorded as a failed
+            # run rather than raised, so it's a failed run rather than a
+            # BackupError, since one dead agent host shouldn't be any
+            # different from any other per-run failure.
+            _record_unsupported_project_agent_run(job_id, compose_project, job_host_id, batch_id)
+            return batch_id
+        _backup_project(
+            job_id=job_id,
+            job_host_id=job_host_id,
+            compose_project=compose_project,
+            job_dest_subpath=job_dest_subpath,
+            job_include_bind_mounts=job_include_bind_mounts,
+            target=target,
+            batch_id=batch_id,
+        )
+        _apply_retention(job_id, compose_project)
+        return batch_id
+
     for identity_key in identity_keys:
         if job_host_id == "local":
             _backup_one_container(
@@ -124,6 +152,23 @@ def run_backup_job(job_id: int, batch_id: str | None = None) -> str:
                 batch_id=batch_id,
             )
     return batch_id
+
+
+def _record_unsupported_project_agent_run(job_id: int, compose_project: str, job_host_id: str, batch_id: str) -> int:
+    with get_session() as session:
+        run = BackupRun(
+            job_id=job_id,
+            identity_key=compose_project,
+            batch_id=batch_id,
+            status="failed",
+            current_stage=None,
+            error_message=f"Project-scoped backup isn't supported for agent host {job_host_id!r} yet",
+            finished_at=datetime.now(timezone.utc),
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        return run.id
 
 
 def _dispatch_agent_backup(
@@ -353,6 +398,208 @@ def _backup_one_container(
         dest_relpath = f"{job_dest_subpath}/{archive_name}".lstrip("/")
         locator = backend.put(final_path, dest_relpath)
         log_line(f"Stored archive as {locator!r} on target {target.name!r} ({size_bytes} bytes)")
+
+        with get_session() as session:
+            run = session.get(BackupRun, run_id)
+            run.status = "success"
+            run.current_stage = "done"
+            run.finished_at = datetime.now(timezone.utc)
+            run.archive_locator = locator
+            run.size_bytes = size_bytes
+            run.log_text = "\n".join(log_lines)
+            run.config_snapshot_json = config_json
+            session.commit()
+        return run_id
+
+    except (ArchiveError, StorageError, docker.errors.DockerException, OSError) as exc:
+        return fail(exc)
+    finally:
+        if staging_local is not None:
+            shutil.rmtree(staging_local, ignore_errors=True)
+
+
+def _backup_project(
+    job_id: int,
+    job_host_id: str,
+    compose_project: str,
+    job_dest_subpath: str,
+    job_include_bind_mounts: bool,
+    target: StorageTarget,
+    batch_id: str,
+) -> int:
+    """Project-scope equivalent of _backup_one_container: discovers every
+    CURRENT container belonging to `compose_project` straight from the
+    Docker daemon (not the DiscoveredContainer table, so a service added
+    to the compose file since the last discovery sync is still included),
+    archives the UNION of their distinct volumes/binds — a volume mounted
+    into several of the project's containers (e.g. a worker sharing media
+    storage with the web service) is archived once, not once per
+    container — into a single archive, and writes one config.json
+    describing every member container (each with its own recreate_spec)
+    so restore.py can recreate the whole stack together. Produces exactly
+    one BackupRun, identity_key = the project name (never ambiguous with
+    a container-mode identity_key: those always contain zero or one "/",
+    a bare project name never does)."""
+    with get_session() as session:
+        run = BackupRun(
+            job_id=job_id,
+            identity_key=compose_project,
+            batch_id=batch_id,
+            status="running",
+            current_stage="inspecting",
+        )
+        session.add(run)
+        session.commit()
+        session.refresh(run)
+        run_id = run.id
+
+    log_lines: list[str] = []
+
+    def log_line(msg: str) -> None:
+        log_lines.append(msg)
+        log.info("[run %s] %s", run_id, msg)
+
+    def set_stage(stage: str, current: int | None = None, total: int | None = None) -> None:
+        with get_session() as session:
+            run = session.get(BackupRun, run_id)
+            run.current_stage = stage
+            run.progress_current = current
+            run.progress_total = total
+            session.commit()
+
+    def fail(error: Exception) -> int:
+        log.exception("Backup run %s (project %s) failed", run_id, compose_project)
+        with get_session() as session:
+            run = session.get(BackupRun, run_id)
+            run.status = "failed"
+            run.finished_at = datetime.now(timezone.utc)
+            run.error_message = str(error)
+            run.log_text = "\n".join(log_lines)
+            session.commit()
+        return run_id
+
+    staging_local: Path | None = None
+    try:
+        endpoint = get_endpoint(job_host_id)
+        client = endpoint.client()
+
+        containers = client.containers.list(
+            all=True, filters={"label": f"com.docker.compose.project={compose_project}"}
+        )
+        if not containers:
+            return fail(BackupError(f"No containers currently found for compose project {compose_project!r}"))
+        member_attrs = [inspect_one(client, c) for c in containers]
+
+        staging_local = config.STAGING_DIR / str(run_id)
+        staging_local.mkdir(parents=True, exist_ok=True)
+        staging_host = endpoint.host_path_for_data(f"staging/{run_id}")
+
+        # Union of every member's archivable mounts, deduped by the same
+        # (kind, sanitized name) key used for the archive member filename
+        # — first container to mention a given volume/bind "wins" and it
+        # is archived exactly once, however many of the project's
+        # containers also mount it.
+        dedup_mounts: dict[str, dict] = {}
+        for attrs in member_attrs:
+            for m in attrs["mounts_json"]:
+                if m["type"] not in ("volume", "bind"):
+                    continue
+                if m["type"] == "bind" and not job_include_bind_mounts:
+                    continue
+                if not m["source"]:
+                    continue
+                kind = "volumes" if m["type"] == "volume" else "bind"
+                raw_name = m["name"] or m["source"]
+                member_name = f"{kind}__{sanitize(raw_name)}"
+                dedup_mounts.setdefault(member_name, {"kind": kind, "raw_name": raw_name, "mount": m})
+
+        set_stage("archiving", current=0, total=len(dedup_mounts))
+        data_manifest = []
+        for i, (member_name, entry) in enumerate(dedup_mounts.items(), start=1):
+            kind, raw_name, mount = entry["kind"], entry["raw_name"], entry["mount"]
+            log_line(f"Archiving {mount['type']} mount {raw_name} -> {member_name}")
+            tar_source_to_staging(client, mount["source"], staging_host, member_name, staging_local)
+            data_manifest.append(
+                {
+                    "kind": kind,
+                    "name": raw_name,
+                    "destination": mount["destination"],
+                    "archive_member": f"data/{kind}/{sanitize(raw_name)}.tar.gz",
+                }
+            )
+            set_stage("archiving", current=i, total=len(dedup_mounts))
+
+        # Union of volume entities (driver/options), deduped by name.
+        volume_entities: dict[str, dict] = {}
+        for attrs in member_attrs:
+            for m in attrs["mounts_json"]:
+                if m["type"] != "volume" or not m["name"] or m["name"] in volume_entities:
+                    continue
+                try:
+                    vol_attrs = client.volumes.get(m["name"]).attrs
+                    volume_entities[m["name"]] = {
+                        "name": vol_attrs.get("Name"),
+                        "driver": vol_attrs.get("Driver"),
+                        "options": vol_attrs.get("Options"),
+                        "labels": vol_attrs.get("Labels"),
+                    }
+                except docker.errors.NotFound:
+                    log_line(f"Volume {m['name']} vanished mid-backup, skipping its entity data")
+
+        # Union of networks, deduped by name.
+        network_entities: dict[str, dict] = {}
+        for attrs in member_attrs:
+            for n in attrs["networks_json"]:
+                network_entities.setdefault(n["name"], n)
+
+        set_stage("packaging")
+        containers_json = [
+            {
+                "identity_key": attrs["identity_key"],
+                "docker_id": attrs["docker_id"],
+                "container_name": attrs["name"],
+                "compose_service": attrs["compose_service"],
+                "recreate_spec": _build_recreate_spec(attrs),
+            }
+            for attrs in member_attrs
+        ]
+        config_json = {
+            "schema_version": 1,
+            "scope": "project",
+            "app_version": _app_version(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "source_host_id": job_host_id,
+            "compose_project": compose_project,
+            "compose": {
+                "working_dir": member_attrs[0]["compose_working_dir"],
+                "config_files": member_attrs[0]["compose_config_files"],
+                "file_available": False,
+            },
+            "networks": list(network_entities.values()),
+            "volumes": list(volume_entities.values()),
+            "containers": containers_json,
+            "data_manifest": data_manifest,
+        }
+        config_path = staging_local / "config.json"
+        config_path.write_text(json.dumps(config_json, indent=2, default=str))
+
+        archive_name = f"{sanitize(compose_project)}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.tar.gz"
+        final_path = staging_local / archive_name
+        with tarfile.open(final_path, "w:gz") as tf:
+            tf.add(config_path, arcname="config.json")
+            for item in data_manifest:
+                member_path = staging_local / f"{item['kind']}__{sanitize(item['name'])}.tar.gz"
+                tf.add(member_path, arcname=item["archive_member"])
+
+        size_bytes = final_path.stat().st_size
+        set_stage("uploading")
+        backend = build_backend(target)
+        dest_relpath = f"{job_dest_subpath}/{archive_name}".lstrip("/")
+        locator = backend.put(final_path, dest_relpath)
+        log_line(
+            f"Stored archive as {locator!r} on target {target.name!r} "
+            f"({size_bytes} bytes, {len(containers_json)} containers, {len(data_manifest)} volumes/binds)"
+        )
 
         with get_session() as session:
             run = session.get(BackupRun, run_id)

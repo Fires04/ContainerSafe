@@ -81,6 +81,22 @@ class BackupJob(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     host_id: Mapped[str] = mapped_column(String, default="local")
+    # "container": identity_keys_json lists the specific containers this
+    # job backs up (today's original model) — one BackupRun per container
+    # per firing, grouped by batch_id. "project": compose_project names a
+    # compose project instead; identity_keys_json is unused/empty. At run
+    # time ALL of that project's current containers are discovered fresh
+    # and backed up together into ONE archive (shared volumes/binds
+    # deduped so a volume mounted into several of the project's
+    # containers — common for e.g. a worker + web service sharing media
+    # storage — is archived once, not once per container), producing a
+    # single BackupRun per firing (identity_key = the project name, never
+    # ambiguous with a container-mode identity_key: those are either a
+    # bare name or "project/service", always containing no slash or one).
+    # New services added to the compose project later are picked up
+    # automatically next run — nothing to reconfigure.
+    scope_type: Mapped[str] = mapped_column(String, default="container")
+    compose_project: Mapped[str | None] = mapped_column(String, nullable=True)
     # List of DiscoveredContainer.identity_key this job backs up together —
     # one job, many containers, one BackupRun per container per firing
     # (see backup.py's batch_id). Migrated from a singular, NOT-NULL

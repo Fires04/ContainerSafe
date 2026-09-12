@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class ContainerOut(BaseModel):
@@ -95,7 +95,13 @@ class BackupJobIn(BaseModel):
     # the operator selects it, so it sends that along rather than the
     # server guessing.
     host_id: str = "local"
-    identity_keys: list[str]
+    # "container" (default): identity_keys names the specific containers.
+    # "project": compose_project names a compose project instead — ALL of
+    # its current containers are backed up together as one unit (see
+    # models.py's BackupJob docstring); identity_keys is ignored.
+    scope_type: Literal["container", "project"] = "container"
+    identity_keys: list[str] = []
+    compose_project: str | None = None
     display_name: str | None = None
     schedule_cron: str
     retention_count: int | None = None
@@ -105,17 +111,21 @@ class BackupJobIn(BaseModel):
     include_bind_mounts: bool = True
     enabled: bool = True
 
-    @field_validator("identity_keys")
-    @classmethod
-    def _at_least_one(cls, value: list[str]) -> list[str]:
-        if not value:
+    @model_validator(mode="after")
+    def _scope_matches_selection(self) -> "BackupJobIn":
+        if self.scope_type == "project":
+            if not self.compose_project:
+                raise ValueError("A project-scoped job needs a compose project")
+        elif not self.identity_keys:
             raise ValueError("A job needs at least one container")
-        return value
+        return self
 
 
 class BackupJobOut(BaseModel):
     id: int
     host_id: str
+    scope_type: str = "container"
+    compose_project: str | None = None
     identity_keys: list[str]
     container_names: list[str] = []
     display_name: str
@@ -170,6 +180,11 @@ class RestoreRequest(BaseModel):
 
 
 class UploadPreview(BaseModel):
+    scope: Literal["container", "project"] = "container"
+    # project scope: one summary dict per member container
+    # ({identity_key, container_name, image, name_conflict,
+    # name_conflict_running}); None/unused for scope=="container".
+    containers: list[dict] | None = None
     identity_key: str | None
     container_name: str | None
     image: str | None

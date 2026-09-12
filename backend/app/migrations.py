@@ -124,9 +124,28 @@ def _add_storage_targets_host_id(engine: Engine) -> None:
         conn.execute(text("UPDATE storage_targets SET host_id = 'local' WHERE host_id IS NULL"))
 
 
+def _add_backup_jobs_scope(engine: Engine) -> None:
+    """scope_type ("container", the pre-existing behavior, or "project")
+    + compose_project, for project-level backup jobs (see models.py's
+    BackupJob docstring)."""
+    cols = _columns(engine, "backup_jobs")
+    changed = False
+    with engine.begin() as conn:
+        if "scope_type" not in cols:
+            conn.execute(text("ALTER TABLE backup_jobs ADD COLUMN scope_type TEXT DEFAULT 'container'"))
+            conn.execute(text("UPDATE backup_jobs SET scope_type = 'container' WHERE scope_type IS NULL"))
+            changed = True
+        if "compose_project" not in cols:
+            conn.execute(text("ALTER TABLE backup_jobs ADD COLUMN compose_project TEXT"))
+            changed = True
+    if changed:
+        log.info("Migrated backup_jobs: added scope_type (default 'container') / compose_project")
+
+
 def run_startup_migrations(engine: Engine) -> None:
     _add_identity_keys_json(engine)
     _add_backup_runs_identity_and_batch(engine)  # must run before the drop below
     _drop_backup_jobs_identity_key(engine)
     _add_backup_runs_progress(engine)
     _add_storage_targets_host_id(engine)
+    _add_backup_jobs_scope(engine)

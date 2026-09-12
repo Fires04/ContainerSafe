@@ -17,6 +17,7 @@ import {
   Paper,
   Progress,
   Select,
+  SegmentedControl,
   Stack,
   Text,
   TextInput,
@@ -29,6 +30,7 @@ import {
   IconEdit,
   IconPlayerPlay,
   IconPlus,
+  IconStack2,
   IconTrash,
 } from '@tabler/icons-react'
 import { api } from '../lib/api'
@@ -129,7 +131,14 @@ export default function JobsPage() {
 
       <Stack gap="md">
         {jobs?.map((j) => (
-          <JobRow key={j.id} job={j} onEdit={() => setEditing(j)} onDelete={() => handleDelete(j.id)} onError={setError} />
+          <JobRow
+            key={j.id}
+            job={j}
+            containers={containers}
+            onEdit={() => setEditing(j)}
+            onDelete={() => handleDelete(j.id)}
+            onError={setError}
+          />
         ))}
       </Stack>
     </div>
@@ -138,11 +147,13 @@ export default function JobsPage() {
 
 function JobRow({
   job,
+  containers,
   onEdit,
   onDelete,
   onError,
 }: {
   job: BackupJob
+  containers: Container[]
   onEdit: () => void
   onDelete: () => void
   onError: (msg: string) => void
@@ -150,6 +161,10 @@ function JobRow({
   const [expanded, setExpanded] = useState(false)
   const [runs, setRuns] = useState<BackupRun[] | null>(null)
   const [running, setRunning] = useState(false)
+  const isProject = job.scope_type === 'project'
+  const projectContainerCount = isProject
+    ? containers.filter((c) => c.host_id === job.host_id && c.compose_project === job.compose_project).length
+    : 0
 
   function loadRuns() {
     api
@@ -189,6 +204,11 @@ function JobRow({
             <Text fw={600} size="sm">
               {job.display_name}
             </Text>
+            {isProject && (
+              <Badge size="xs" color="shield" variant="light" leftSection={<IconStack2 size={11} />}>
+                project
+              </Badge>
+            )}
             {job.host_id !== 'local' && (
               <Badge size="xs" color="flame" variant="outline">
                 {job.host_id}
@@ -201,7 +221,10 @@ function JobRow({
             )}
           </Group>
           <Text size="xs" c="dimmed" truncate>
-            {job.container_names.join(', ')} · cron <code>{job.schedule_cron}</code> · {job.storage_target_name ?? '?'}
+            {isProject
+              ? `${job.compose_project} (${projectContainerCount} container${projectContainerCount === 1 ? '' : 's'})`
+              : job.container_names.join(', ')}{' '}
+            · cron <code>{job.schedule_cron}</code> · {job.storage_target_name ?? '?'}
             {job.retention_count ? ` · keep last ${job.retention_count}` : ''}
             {job.next_run_at ? ` · next ${new Date(job.next_run_at).toLocaleString()}` : ''}
           </Text>
@@ -238,7 +261,7 @@ function JobRow({
             </Text>
           )}
           {batches.groupEntries.map(([batchId, batchRuns]) => (
-            <BatchGroup key={batchId} runs={batchRuns} expectedCount={job.identity_keys.length} />
+            <BatchGroup key={batchId} runs={batchRuns} expectedCount={isProject ? 1 : job.identity_keys.length} />
           ))}
           {batches.ungrouped.map((r) => (
             <RunCard key={r.id} run={r} />
@@ -446,7 +469,9 @@ function JobForm({
   onError: (msg: string) => void
 }) {
   const [hostId, setHostId] = useState(job?.host_id ?? 'local')
+  const [scopeType, setScopeType] = useState<'container' | 'project'>(job?.scope_type ?? 'container')
   const [identityKeys, setIdentityKeys] = useState<string[]>(job?.identity_keys ?? [])
+  const [composeProject, setComposeProject] = useState<string | null>(job?.compose_project ?? null)
   const [displayName, setDisplayName] = useState(job?.display_name ?? '')
   const [cron, setCron] = useState(job?.schedule_cron ?? '0 3 * * *')
   const [cronDescription, setCronDescription] = useState<string | null>(null)
@@ -477,7 +502,12 @@ function JobForm({
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault()
-    if (identityKeys.length === 0) {
+    if (scopeType === 'project') {
+      if (!composeProject) {
+        onError('Pick a compose project')
+        return
+      }
+    } else if (identityKeys.length === 0) {
       onError('Pick at least one container')
       return
     }
@@ -486,7 +516,9 @@ function JobForm({
     try {
       const body = {
         host_id: hostId,
-        identity_keys: identityKeys,
+        scope_type: scopeType,
+        identity_keys: scopeType === 'container' ? identityKeys : [],
+        compose_project: scopeType === 'project' ? composeProject : null,
         display_name: displayName || undefined,
         schedule_cron: cron,
         retention_count: retentionCount === '' ? null : retentionCount,
@@ -511,6 +543,13 @@ function JobForm({
 
   const hostIds = [...new Set(containers.map((c) => c.host_id))].sort((a, b) => (a === 'local' ? -1 : b === 'local' ? 1 : a.localeCompare(b)))
   const containersOnHost = containers.filter((c) => c.host_id === hostId)
+  const projectCounts = new Map<string, number>()
+  for (const c of containersOnHost) {
+    if (c.compose_project) projectCounts.set(c.compose_project, (projectCounts.get(c.compose_project) ?? 0) + 1)
+  }
+  const projectOptions = [...projectCounts.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([name, count]) => ({ value: name, label: `${name} (${count} container${count === 1 ? '' : 's'})` }))
 
   return (
     <form onSubmit={handleSubmit}>
@@ -522,22 +561,54 @@ function JobForm({
         onChange={(v) => {
           setHostId(v ?? 'local')
           setIdentityKeys([])
+          setComposeProject(null)
         }}
         disabled={job !== null}
         required
         mb="sm"
       />
-      <MultiSelect
-        label="Containers"
-        description="Pick every container this job should back up together — picked ones drop off this list"
-        data={containersOnHost.map((c) => ({ value: c.identity_key, label: c.name }))}
-        value={identityKeys}
-        onChange={setIdentityKeys}
-        searchable
-        hidePickedOptions
-        required
+
+      <Text size="sm" fw={500} mb={4}>
+        Back up
+      </Text>
+      <SegmentedControl
+        fullWidth
+        disabled={job !== null}
+        value={scopeType}
+        onChange={(v) => setScopeType(v as 'container' | 'project')}
+        data={[
+          { label: 'Compose project', value: 'project' },
+          { label: 'Individual containers', value: 'container' },
+        ]}
         mb="sm"
       />
+
+      {scopeType === 'project' ? (
+        <Select
+          label="Compose project"
+          description="Every container currently in this project is backed up together into one archive — shared volumes are archived once, and services added to the project later are picked up automatically"
+          data={projectOptions}
+          value={composeProject}
+          onChange={setComposeProject}
+          placeholder={projectOptions.length === 0 ? 'No compose projects discovered on this host' : 'Pick a project'}
+          searchable
+          required
+          disabled={job !== null}
+          mb="sm"
+        />
+      ) : (
+        <MultiSelect
+          label="Containers"
+          description="Pick every container this job should back up together — picked ones drop off this list"
+          data={containersOnHost.map((c) => ({ value: c.identity_key, label: c.name }))}
+          value={identityKeys}
+          onChange={setIdentityKeys}
+          searchable
+          hidePickedOptions
+          required
+          mb="sm"
+        />
+      )}
       <TextInput
         label="Display name (optional)"
         value={displayName}

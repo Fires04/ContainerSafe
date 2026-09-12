@@ -55,6 +55,8 @@ export interface StorageTarget {
 export interface BackupJob {
   id: number;
   host_id: string;
+  scope_type: 'container' | 'project';
+  compose_project: string | null;
   identity_keys: string[];
   container_names: string[];
   display_name: string;
