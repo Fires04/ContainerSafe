@@ -22,6 +22,7 @@ COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 COMPOSE_SERVICE_LABEL = "com.docker.compose.service"
 COMPOSE_WORKING_DIR_LABEL = "com.docker.compose.project.working_dir"
 COMPOSE_CONFIG_FILES_LABEL = "com.docker.compose.project.config_files"
+COMPOSE_CONTAINER_NUMBER_LABEL = "com.docker.compose.container-number"
 
 
 def _mount_summary(attrs: dict) -> list[dict]:
@@ -73,6 +74,17 @@ def _identity_key(name: str, labels: dict) -> str:
     project = labels.get(COMPOSE_PROJECT_LABEL)
     service = labels.get(COMPOSE_SERVICE_LABEL)
     if project and service:
+        # A scaled compose service (`docker compose up --scale x=N`) runs
+        # several containers sharing the same project+service labels,
+        # distinguished only by this container-number label — without it
+        # in the key, replica 2+ would collide with replica 1 on the
+        # (host_id, identity_key) unique constraint. Only suffix when
+        # there's more than one replica so the common (unscaled) case
+        # keeps today's identity_key unchanged — existing BackupJob rows
+        # reference it and shouldn't need remapping.
+        number = labels.get(COMPOSE_CONTAINER_NUMBER_LABEL)
+        if number and number != "1":
+            return f"{project}/{service}-{number}"
         return f"{project}/{service}"
     return name.lstrip("/")
 
@@ -137,6 +149,14 @@ def _upsert_rows(session: Session, host_id: str, seen: list[dict]) -> list[Disco
         if row is None:
             row = DiscoveredContainer(host_id=host_id, identity_key=item["identity_key"])
             session.add(row)
+            # Guard against two items in the same `seen` batch computing
+            # the same identity_key (e.g. an _identity_key() edge case we
+            # haven't accounted for) — without this, the second one would
+            # try to INSERT a brand new row with the same (host_id,
+            # identity_key) as the first and blow up the whole sync's
+            # commit with a UNIQUE constraint violation instead of just
+            # overwriting with the later (still valid) sighting.
+            existing[item["identity_key"]] = row
         for field, value in item.items():
             setattr(row, field, value)
         row.last_seen_at = now

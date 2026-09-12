@@ -38,6 +38,11 @@ def refresh_containers():
             try:
                 rows.extend(sync(session, endpoint))
             except Exception as exc:  # daemon unreachable, permission error, ...
+                # Roll back before this session is used again below — a
+                # failed flush/commit (e.g. a constraint violation) leaves
+                # the session's transaction unusable for any further
+                # query until it's explicitly rolled back.
+                session.rollback()
                 errors.append(f"{endpoint.host_id}: {exc}")
 
         registry = get_agent_registry()
